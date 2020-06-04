@@ -3,7 +3,7 @@
 Plugin Name: Instagram Wordpress API
 Plugin URI: http://github.com/msigley/
 Description: Provides functions for accessing the Instagram API. Leverages the Wordpress HTTP API.
-Version: 1.0.0
+Version: 2.0.0
 Author: Matthew Sigley
 License: GPL2
 */
@@ -13,9 +13,11 @@ defined( 'WPINC' ) || header( 'HTTP/1.1 403' ) & exit; // Prevent direct access
 class Instagram_WP_API {
 	private static $version = '1.0.0';
 	private static $object = null;
-	private static $root_endpoint_url = 'https://api.instagram.com/v1/';
+	private static $root_endpoint_url = 'https://graph.instagram.com/';
 	private static $contruct_args = array( 'client_id', 'client_secret' );
 	
+	public $rest = null;
+
 	private $client_id = null;
 	private $client_secret = null;
 	private $access_token = null;
@@ -27,19 +29,32 @@ class Instagram_WP_API {
 			if( !empty($arg_value) && in_array($arg_name, self::$contruct_args) )
 				$this->$arg_name = $arg_value;
 		}
-		
-		//General API
-		require_once 'api.php';
+	}
+
+	public function init() {
+		//Plugin path
+		$this->path = plugin_dir_path( __FILE__ );
+
+		$this->access_token = get_option( 'instagram_wp_api_access_token' );
+		$this->access_token_expires = get_option( 'instagram_wp_api_access_token_expires' );
 
 		//Plugin activation/deactivation
-		//register_activation_hook( __FILE__, array($this, 'activation') );
+		register_activation_hook( __FILE__, array($this, 'activation') );
 		register_deactivation_hook( __FILE__, array($this, 'deactivation') );
+
+		//REST API
+		require_once $this->path . 'rest.php';
+		$this->rest = new Instagram_WP_API_REST( array( 'root_endpoint_url' => 'https://graph.instagram.com/', 'authorization_header' => 'Bearer ' . $this->access_token ) );
+
+		//General API
+		require_once 'api.php';
 
 		//oEmbed API
 		add_filter('oembed_fetch_url', array($this, 'oembed_fetch_url'), 1, 3);
 		add_filter('embed_oembed_html', array($this, 'embed_oembed_html'), 1, 2);
 
-		$this->access_token = get_option( 'instagram_wp_api_access_token' );
+		//WP Cron
+		add_action( 'instagram_wp_api_refresh_access_token', array( $this, 'refresh_access_token' ) );
 
 		if( is_admin() ) {
 			add_action( 'admin_init', array($this, 'handle_oauth_response') );
@@ -67,13 +82,24 @@ class Instagram_WP_API {
 		return self::$object;
 	}
 
+	public function activation() {
+		if( !wp_next_scheduled( 'instagram_wp_api_refresh_access_token' ) ) {
+			$start_of_day = time();
+			$start_of_day -= $start_of_day % DAY_IN_SECONDS;
+			wp_schedule_event( $start_of_day, 'twicedaily', 'instagram_wp_api_refresh_access_token' );
+		}
+	}
+
 	public function deactivation() {
+		delete_option( 'instagram_wp_api_access_token' );
+		delete_option( 'instagram_wp_api_access_token_expires' );
+		wp_clear_scheduled_hook( 'instagram_wp_api_refresh_access_token' );
 		wp_cache_flush();
 	}
 
 	public function oauth_notice() {
 		$oauth_url = 'https://api.instagram.com/oauth/authorize/?client_id='.$this->client_id.
-			'&redirect_uri='.urlencode( admin_url( '?instagram_oauth_nonce=1', 'https' ) ).'&response_type=code';
+			'&redirect_uri='.urlencode( admin_url( '', 'https' ) ).'&scope=user_profile,user_media&response_type=code&state=instagram_oauth_nonce_1';
 		?>
 		<div class="notice notice-error error">
       <p><strong>Instagram Wordpress API:</strong> Bad or missing user access token. <a href="<?php echo $oauth_url; ?>">Please reauthenicate with Instagram to pull and display content from Instagram.</a></p>
@@ -84,115 +110,93 @@ class Instagram_WP_API {
 	}
 
 	public function handle_oauth_response() {
-		if( empty($_REQUEST['instagram_oauth_nonce']) )
+		if( empty( $_REQUEST['code'] ) || empty( $_REQUEST['state'] ) || substr( $_REQUEST['state'], 0, 22 ) !== 'instagram_oauth_nonce_' )
+			return;
+
+		$nonce = substr( $_REQUEST['state'], 22 );
+		if( empty( $nonce ) )
 			return;
 
 		$post_array = array(
 			'client_id' => $this->client_id,
 			'client_secret' => $this->client_secret,
 			'grant_type' => 'authorization_code',
-			'redirect_uri' => admin_url( '?instagram_oauth_nonce=1', 'https' ),
+			'redirect_uri' => admin_url( '', 'https' ),
 			'code' => $_REQUEST['code']
 		);
 		
 		$headers = array();
 		$args = array( 'headers' => $headers, 'sslverify' => false, 'body' => $post_array );
 		
-		$response = wp_remote_post('https://api.instagram.com/oauth/access_token', $args);
-		if( !is_wp_error($response) 
-			&& 200 == wp_remote_retrieve_response_code($response) ) {
+		$access_token = false;
+		$expires = 0;
+
+		// Request a short lived access token
+		$response = wp_remote_post( 'https://api.instagram.com/oauth/access_token', $args) ;
+		if( !is_wp_error( $response ) && 200 == wp_remote_retrieve_response_code( $response ) ) {
 			$response_body = wp_remote_retrieve_body( $response );
 			$response_body = json_decode( $response_body );
-
-			if( !empty($response_body->access_token) )
-				update_option( 'instagram_wp_api_access_token', $response_body->access_token, true );
+			if( !empty( $response_body->access_token ) ) {
+				// Exchange the short lived access token for a long lived on
+				$query_string = build_query( 
+					array(
+						'access_token' => $response_body->access_token,
+						'client_secret' => $this->client_secret,
+						'grant_type' => 'ig_exchange_token'
+					)
+				);
+				
+				$headers = array();
+				$args = array( 'headers' => $headers, 'sslverify' => false, 'body' => array() );
+				$response = wp_remote_get( "https://graph.instagram.com/access_token?$query_string", $args) ;
+				if( !is_wp_error( $response ) && 200 == wp_remote_retrieve_response_code( $response ) ) {
+					$response_body = wp_remote_retrieve_body( $response );
+					$response_body = json_decode( $response_body );
+	
+					if( !empty( $response_body->access_token ) ) {
+						$access_token = $response_body->access_token;
+						$expires = time() + $response_body->expires_in - 30;
+					}
+				}
+			}
 		}
+
+		update_option( 'instagram_wp_api_access_token', $access_token, true );
+		update_option( 'instagram_wp_api_access_token_expires', $expires, true );
 
 		wp_redirect( admin_url( '', 'https'), 307 );
 		die();
 	}
-	
-	public function get_request($endpoint, $query_args=array()) {
-		if( is_array($query_args) ) {
-			$query_args['access_token'] = $this->access_token;
-			$query_args = '?'.build_query($query_args);
-		} else {
-			$query_args .= 'access_token='.$this->access_token;
-		}
-		$endpoint = ltrim($endpoint, '/');
-		$request_url = trailingslashit(self::$root_endpoint_url . $endpoint) . $query_args;
 
-		if( $cached = $this->get_cached_request( $endpoint, 'get', $query_args ) )
-			return json_decode( $cached );
+	public function refresh_access_token() {
+		if( empty( $this->access_token ) || empty( $this->expires ) || $this->expires - time() > WEEK_IN_SECONDS )
+			return;
+
+		// Exchange the short lived access token for a long lived on
+		$query_string = build_query( 
+			array(
+				'access_token' => $this->access_token,
+				'grant_type' => 'ig_refresh_token'
+			)
+		);
 		
 		$headers = array();
-		$args = array( 'headers' => $headers, 'sslverify' => false );
-		
-		$response = wp_remote_get($request_url, $args);
-		if( is_wp_error($response) 
-			|| 200 != wp_remote_retrieve_response_code($response) ) {
-			return false;
-		}
-		
-		$response_body = wp_remote_retrieve_body( $response );
-		$this->cache_request( $response_body, $endpoint, 'get', $query_args );
-		return json_decode( $response_body );
-	}
+		$args = array( 'headers' => $headers, 'sslverify' => false, 'body' => array() );
+		$response = wp_remote_get( "https://graph.instagram.com/refresh_access_token?$query_string", $args) ;
+		var_dump( $response );
+		die();
+		if( !is_wp_error( $response ) && 200 == wp_remote_retrieve_response_code( $response ) ) {
+			$response_body = wp_remote_retrieve_body( $response );
+			$response_body = json_decode( $response_body );
 
-	public function post_request($endpoint, $post_array) {
-		if( !is_array($post_array) )
-			return false;
-		$endpoint = ltrim($endpoint, '/');
-		$request_url = trailingslashit(self::$root_endpoint_url . $endpoint);
-		$post_array['access_token'] = $this->access_token;
-
-		if( $cached = $this->get_cached_request( $endpoint, 'post', $post_array ) )
-			return json_decode( $cached );
-		
-		$headers = array();
-		$args = array( 'headers' => $headers, 'sslverify' => false, 'body' => $post_array );
-		
-		$response = wp_remote_post($request_url, $args);
-		if( is_wp_error($response) 
-			|| 200 != wp_remote_retrieve_response_code($response) ) {
-			return false;
-		}
-		
-		$response_body = wp_remote_retrieve_body( $response );
-		$this->cache_request( $response_body, $endpoint, 'post', $post_array );
-		return json_decode( $response_body );
-	}
-
-	public function request($endpoint, $method, $body) {
-		$endpoint = ltrim($endpoint, '/');
-		$request_url = self::$root_endpoint_url . $endpoint;
-		$body['access_token'] = $this->access_token;
-
-		if( $cached = $this->get_cached_request( $endpoint, $method, $body ) )
-			return json_decode( $cached );
-
-		$headers = array();
-		$args = array( 'method' => $method, 'headers' => $headers, 'sslverify' => false, 'body' => $body );
-		
-		$response = wp_remote_request($request_url, $args);
-		if( is_wp_error($response) 
-			|| 200 != wp_remote_retrieve_response_code($response) ) {
-			return false;
+			if( !empty( $response_body->access_token ) ) {
+				$this->access_token = $response_body->access_token;
+				$this->expires = time() + $response_body->expires_in - 30;
+			}
 		}
 
-		$response_body = wp_remote_retrieve_body( $response );
-		$this->cache_request( $response_body, $endpoint, $method, $body );
-		return json_decode( $response_body );
-	}
-
-	public function get_cached_request($endpoint, $method, $body=array()) {
-		$cache_key = 'request:'.md5( 'endpoint:'.$endpoint.';method:'.$method.';body:'.serialize($body) );
-		return wp_cache_get( $cache_key, 'instagram_wp_api' );
-	}
-
-	public function cache_request($data, $endpoint, $method, $body=array()) {
-		$cache_key = 'request:'.md5( 'endpoint:'.$endpoint.';method:'.$method.';body:'.serialize($body) );
-		wp_cache_set( $cache_key, $data, 'instagram_wp_api', 43200 ); //Cache requests for half a day
+		update_option( 'instagram_wp_api_access_token', $this->access_token, true );
+		update_option( 'instagram_wp_api_access_token_expires', $this->expires, true );
 	}
 
 	public function oembed_fetch_url($provider, $url, $args) {
@@ -249,3 +253,4 @@ class Instagram_WP_API {
 }
 
 $Instagram_WP_API = Instagram_WP_API::object();
+$Instagram_WP_API->init();
