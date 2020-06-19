@@ -1,3 +1,4 @@
+[![ko-fi](https://www.ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/A0A01FORH)
 # WP-Instagram-API
 Instagram Basic Display API plugin for Wordpress
 
