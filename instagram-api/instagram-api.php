@@ -3,7 +3,7 @@
 Plugin Name: Instagram Wordpress API
 Plugin URI: http://github.com/msigley/
 Description: Provides functions for accessing the Instagram API. Leverages the Wordpress HTTP API.
-Version: 2.0.0
+Version: 2.0.1
 Author: Matthew Sigley
 License: GPL2
 */
@@ -21,6 +21,7 @@ class Instagram_WP_API {
 	private $client_id = null;
 	private $client_secret = null;
 	private $access_token = null;
+	private $access_token_expires = null;
 
 	public $embed_js = false;
 	
@@ -169,7 +170,7 @@ class Instagram_WP_API {
 	}
 
 	public function refresh_access_token() {
-		if( empty( $this->access_token ) || empty( $this->expires ) || $this->expires - time() > WEEK_IN_SECONDS )
+		if( empty( $this->access_token ) || empty( $this->access_token_expires ) || $this->access_token_expires - time() > WEEK_IN_SECONDS )
 			return;
 
 		// Exchange the short lived access token for a long lived on
@@ -183,20 +184,18 @@ class Instagram_WP_API {
 		$headers = array();
 		$args = array( 'headers' => $headers, 'sslverify' => false, 'body' => array() );
 		$response = wp_remote_get( "https://graph.instagram.com/refresh_access_token?$query_string", $args) ;
-		var_dump( $response );
-		die();
 		if( !is_wp_error( $response ) && 200 == wp_remote_retrieve_response_code( $response ) ) {
 			$response_body = wp_remote_retrieve_body( $response );
 			$response_body = json_decode( $response_body );
 
 			if( !empty( $response_body->access_token ) ) {
 				$this->access_token = $response_body->access_token;
-				$this->expires = time() + $response_body->expires_in - 30;
+				$this->access_token_expires = time() + $response_body->expires_in - 30;
 			}
 		}
 
 		update_option( 'instagram_wp_api_access_token', $this->access_token, true );
-		update_option( 'instagram_wp_api_access_token_expires', $this->expires, true );
+		update_option( 'instagram_wp_api_access_token_expires', $this->access_token_expires, true );
 	}
 
 	public function oembed_fetch_url($provider, $url, $args) {
