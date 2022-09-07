@@ -66,9 +66,13 @@ class Instagram_WP_API_REST {
 		if( 200 != $response_code && 400 != $response_code )
 			return false;
 		
-		$response_body = wp_remote_retrieve_body( $response );
-		$this->cache_request( $response_body, $endpoint, $method, $body );
-		return json_decode( $response_body );
+		$response_body = wp_remote_retrieve_body($response);
+		$response_body_json = json_decode($response_body);
+		if (isset($response_body_json->error) || !isset($response_body_json->data)) {
+			return false;
+		}
+		$this->cache_request($response_body, $endpoint, $method, $body);
+		return $response_body_json;
 	}
 
 	private function get_cached_request( $endpoint, $method, $body=array() ) {

@@ -3,7 +3,7 @@
 Plugin Name: Instagram Wordpress API
 Plugin URI: http://github.com/msigley/
 Description: Provides functions for accessing the Instagram API. Leverages the Wordpress HTTP API.
-Version: 2.0.1
+Version: 2.0.2
 Author: Matthew Sigley
 License: GPL2
 */
